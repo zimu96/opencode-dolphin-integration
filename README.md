@@ -1,6 +1,4 @@
-================================================================================
-  "Apri OpenCode qui" per Dolphin (KDE Plasma 6)
-================================================================================
+"Apri OpenCode qui" per Dolphin (KDE Plasma 6)
 
 Verificato su: CachyOS, KDE Plasma 6.7.5, Dolphin 26.08.1, KIO 6.30,
 konsole 25.x, opencode 2.0.18, Wayland.
