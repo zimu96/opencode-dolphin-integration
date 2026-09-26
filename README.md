@@ -29,6 +29,11 @@ Se per un motivo l'incolla non riesce, il percorso va negli appunti e dentro
 opencode basta Ctrl+Shift+V. Solo in quel caso viene toccata la cronologia
 del clipboard: se l'incolla funziona, gli appunti restano intatti.
 
+<img width="975" height="870" alt="Schermata_20260926_225933" src="https://github.com/user-attachments/assets/0546492c-6aad-4983-8028-c03e4b2126ae" />
+<img width="976" height="793" alt="Schermata_20260926_230002" src="https://github.com/user-attachments/assets/259589a4-241c-462e-b4e2-94d69ede42a7" />
+<img width="1920" height="1080" alt="Schermata_20260926_230044" src="https://github.com/user-attachments/assets/8dbbe6c4-6293-4108-81ac-656398ac57a7" />
+<img width="1920" height="1080" alt="Schermata_20260926_230106" src="https://github.com/user-attachments/assets/f22a93f0-b449-4b8a-8173-1bde13a89ec0" />
+
 
 INSTALLAZIONE
 -------------
