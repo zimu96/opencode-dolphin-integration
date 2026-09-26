@@ -1,0 +1,131 @@
+#!/bin/sh
+#
+# opencode-in  --  launcher interno, usato da opencode-here
+#
+# Koncole esegue tutto cio' che segue a "-e" passando gli argomenti da una
+# shell, quindi un percorso con spazi verrebbe corrotto. Per questo konsole
+# riceve SOLO questo percorso (senza spazi) e cartella/file viaggiano con
+# le variabili d'ambiente OPENCODE_HERE_DIR e OPENCODE_HERE_FILE.
+#
+# Non chiamare questo script a mano: usa opencode-here.
+#
+# Comportamento: apre opencode SUBITO, senza stampare nulla prima. Quando
+# opencode esce, konsole chiude la finestra come fa un terminale normale.
+#
+# RESISTENZA AGLI AGGIORNAMENTI:
+#  - cerca opencode in piu' posizioni, non solo in /usr/bin
+#  - se una versione futura non accetta piu' l'argomento <directory>, ricade
+#    sul cwd (che impostiamo comunque qui sotto)
+
+set -u
+
+: "${OPENCODE_HERE_DIR:?opencode-in: OPENCODE_HERE_DIR non impostata}"
+
+# --- 1. trova opencode --------------------------------------------------------
+# OPENCODE_HERE_BIN ha la precedenza: se un giorno opencode si sposta, basta
+# impostare quella variabile senza toccare questo file.
+find_opencode() {
+	if [ -n "${OPENCODE_HERE_BIN:-}" ] && [ -x "${OPENCODE_HERE_BIN}" ]; then
+		printf '%s' "$OPENCODE_HERE_BIN"
+		return 0
+	fi
+	_p=$(command -v opencode 2>/dev/null) || _p=""
+	if [ -n "$_p" ] && [ -x "$_p" ]; then
+		printf '%s' "$_p"
+		return 0
+	fi
+	for _c in /usr/bin/opencode /usr/local/bin/opencode \
+		"$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode"; do
+		if [ -x "$_c" ]; then
+			printf '%s' "$_c"
+			return 0
+		fi
+	done
+	return 1
+}
+
+OPENCODE=$(find_opencode) || {
+	printf 'opencode-in: opencode non trovato in nessuna posizione nota.\n' >&2
+	printf 'Prova a impostare OPENCODE_HERE_BIN=/percorso/di/opencode\n' >&2
+	exit 1
+}
+
+# --- 2. posizionati nella cartella --------------------------------------------
+cd "$OPENCODE_HERE_DIR" || {
+	printf 'opencode-in: impossibile entrare in %s\n' "$OPENCODE_HERE_DIR" >&2
+	exit 1
+}
+
+# --- 3. costruisci la riga di comando ----------------------------------------
+# Dichiariamo a opencode-here quale sessione di konsole e' questa, cosi' lui
+# puo' iniettarci il percorso con la stessa API di incolla di Ctrl+Shift+V.
+# Lo facciamo PRIMA di exec: siamo gia' dentro la sessione, quindi la
+# sessione e' sicuramente registrata, e dopo exec non potremmo piu' scrivere.
+if [ -n "${OPENCODE_HERE_TOKEN:-}" ]; then
+	_sf="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-here-ses.$OPENCODE_HERE_TOKEN"
+	_mypid=$$
+	# cerchiamo la sessione di konsole che ha questo processo dentro
+	_found=""
+	for _k in 1 2 3 4 5 6 7 8; do
+		for _kp in $(pgrep -x konsole 2>/dev/null); do
+			_bus="org.kde.konsole-$_kp"
+			for _s in 1 2 3 4; do
+				qdbus6 "$_bus" "/Sessions/$_s" org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1 || continue
+				_pid=$(qdbus6 "$_bus" "/Sessions/$_s" org.kde.konsole.Session.processId 2>/dev/null)
+				[ "$_pid" = "$_mypid" ] || continue
+				_found="$_bus $_s"
+				break
+			done
+			[ -n "$_found" ] && break
+		done
+		[ -n "$_found" ] && break
+		sleep 0.2
+	done
+	printf '%s %s\n' "$_mypid" "$_found" >"$_sf" 2>/dev/null || true
+fi
+
+# opencode documenta "opencode [<directory>]" in --help. Se un aggiornamento
+# lo rimuovesse, non gli passiamo la cartella e ci basiamo sul cwd: stesso
+# risultato, nessuna dipendenza da un'opzione che potrebbe sparire.
+# La risposta viene memorizzata (con la versione di opencode) per non lanciare
+# --help a ogni apertura.
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-here-dirarg"
+ver=$("$OPENCODE" --version 2>/dev/null | head -1)
+have_dir_arg=unknown
+if [ -r "$CACHE" ]; then
+	read -r cached_ver cached_flag <"$CACHE" 2>/dev/null || true
+	if [ "${cached_ver:-}" = "$ver" ] && [ "${cached_flag:-}" = "1" -o "${cached_flag:-}" = "0" ]; then
+		have_dir_arg=$cached_flag
+	fi
+fi
+if [ "$have_dir_arg" = "unknown" ]; then
+	if "$OPENCODE" --help 2>&1 | grep -q '\[<directory>\]'; then
+		have_dir_arg=1
+	else
+		have_dir_arg=0
+	fi
+	printf '%s %s' "$ver" "$have_dir_arg" >"$CACHE" 2>/dev/null || true
+fi
+
+set --
+if [ "$have_dir_arg" = "1" ]; then
+	set -- "$OPENCODE_HERE_DIR"
+fi
+
+# Se hai cliccato un FILE e vuoi che venga spedito subito, opencode-here lo
+# mette in OPENCODE_HERE_FILE. Attenzione: opencode non accetta un file come
+# argomento (risponde "ENOTDIR: not a directory"), quindi l'unica
+# interfaccia disponibile e' --prompt, che INVIA una richiesta al modello.
+# Per questo si esegue solo se OPENCODE_HERE_SEND=1: di default il file resta
+# negli appunti e lo incolli tu con Ctrl+V.
+if [ -n "${OPENCODE_HERE_FILE:-}" ] && [ "${OPENCODE_HERE_SEND:-0}" = "1" ]; then
+	set -- "$@" --prompt "@$OPENCODE_HERE_FILE"
+fi
+
+# La copia negli appunti la fa opencode-here, e solo se l'incolla
+# automatica non riesce: cosi' quando funziona la cronologia del clipboard
+# non si riempie di percorsi.
+
+# --- avvia e basta -----------------------------------------------------------
+# --- 5. avvia e basta ---------------------------------------------------------
+exec "$OPENCODE" "$@"

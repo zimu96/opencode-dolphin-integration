@@ -1,0 +1,256 @@
+#!/bin/sh
+#
+# opencode-here  --  aperto dal menu contestuale di Dolphin
+#
+# Si comporta esattamente come "Apri terminale qui": apre una finestra di
+# terminale nella cartella dell'elemente su cui hai cliccato, ma al posto della
+# shell ci avvia opencode.
+#
+# Uso interno:  opencode-here <url-o-percorso> [...]
+#   - se passi una cartella  -> il terminale si apre lì
+#   - se passi un file       -> il terminale si apre nella cartella che lo contiene
+#   - se passi più elementi  -> si usa il primo
+#
+# Vive in ~/.local/bin, quindi non viene mai toccato dagli aggiornamenti.
+
+set -u
+
+# Percorso assoluto: cosi' non dipende dal PATH ereditato da Dolphin.
+OPENCODE_BIN=/usr/bin/opencode
+
+# ===========================================================================
+#  SE clicchi un FILE, vuoi che opencode lo riceva anche?
+#
+#    1 = si'  -> passo il file con --prompt "@file".
+#               ATTENZIONE: --prompt INVIA una richiesta al modello AI, quindi
+#               ogni click su un file consuma token. opencode non accetta un
+#               file come argomento (risponde "ENOTDIR"), quindi --prompt e'
+#               l'unica via per inviarlo in automatico.
+#    0 = no   -> il file va negli APPONTI (vedi sotto) e dentro opencode
+#               basta Ctrl+V. Nessun token, e decidi tu quando inviare.
+#
+#  Metti 0 se non ti serve e non vuoi spendere token.
+# ===========================================================================
+OPEN_FILE_IN_OPENCODE=0
+
+# ===========================================================================
+#  Copiare il percorso negli APPONTI
+#
+#    Appena opencode si apre il percorso e' gia' negli appunti: premi
+#    Ctrl+Shift+V (la scorciatoia di konsole, che e' quella che opencode
+#    usa per incollare) e il path compare nella casella di scrittura.
+#    Non costa nulla e non parte nessuna richiesta all'AI.
+#
+#      cartella -> /percorso/della/cartella
+#      file     -> @/percorso/del/file   (la @ fa si' che opencode lo alleghi)
+#
+#    Se non lo vuoi proprio: metti 0.
+# ===========================================================================
+COPY_PATH_TO_CLIPBOARD=1
+
+# ===========================================================================
+#  Incollare il percorso DENTRO opencode, senza inviarlo
+#
+#    1 = si' (default) -> konsole inietta il percorso nella casella di scrittura
+#               di opencode con la sua stessa API di incolla (D-Bus sendText),
+#               che e' quello che fa Ctrl+Shift+V. Il testo resta li', NON
+#               viene inviato all'AI: lo modifichi e lo mandi con Invio quando
+#               vuoi tu. opencode impiega un secondo ad avviarsi, quindi il
+#               testo arriva dopo circa PASTE_DELAY secondi.
+#    0 = no   -> si usa solo la clipboard (Ctrl+Shift+V dentro opencode)
+#
+#  Se non funziona, controlla che in konsole sia attiva l'opzione
+#  "Abilita le parti sensibili dell'API DBus" (Impostazioni -> Generale).
+#  opencode-here-check ti dice se manca.
+# ===========================================================================
+AUTO_PASTE_IN_OPENCODE=1
+
+# Secondi da aspettare prima di incollare: opencode deve aver avviato la TUI.
+PASTE_DELAY=2.5
+
+# ===========================================================================
+#  Appunti: solo se l'incolla automatica non riesce
+#
+#    1 = si' (default) -> se l'incolla non riesce, il percorso finisce negli
+#               appunti e dentro opencode lo incolli con Ctrl+Shift+V.
+#               Se l'incolla riesce, gli appunti NON vengono toccati, cosi' la
+#               cronologia del clipboard non si riempie di percorsi.
+#    0 = no
+# ===========================================================================
+CLIPBOARD_FALLBACK=1
+
+# Log degli argomenti ricevuti dal menu (utile per capire cosa passa Dolphin).
+# Il log e' minuscolo e si azzera da solo quando supera 64 KB.
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-here.log"
+if [ -w "$(dirname -- "$LOG")" ] 2>/dev/null; then
+	[ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 65536 ] && : >"$LOG"
+	printf '%s argv:' "$(date '+%F %T')" >>"$LOG" 2>/dev/null || true
+	for a in "$@"; do printf ' [%s]' "$a" >>"$LOG" 2>/dev/null || true; done
+	printf '\n' >>"$LOG" 2>/dev/null || true
+fi
+
+die() {
+	printf 'opencode-here: %s\n' "$1" >&2
+	if command -v kdialog >/dev/null 2>&1; then
+		kdialog --error "$1" >/dev/null 2>&1 || true
+	elif command -v zenity >/dev/null 2>&1; then
+		zenity --error --no-markup --text="$1" >/dev/null 2>&1 || true
+	fi
+	exit 1
+}
+
+# "file:///home/zimu96/Documenti"  ->  /home/zimu96/Documenti  (con %20 decodificato)
+url_to_path() {
+	python3 - "$1" <<'PY' 2>/dev/null || printf '%s' "$1"
+import sys
+from urllib.parse import unquote, urlparse
+
+raw = sys.argv[1]
+if "://" in raw:
+    p = urlparse(raw)
+    path = unquote(p.path)
+    if p.netloc and p.netloc != "localhost":
+        path = "//" + p.netloc + path
+else:
+    path = raw
+sys.stdout.write(path)
+PY
+}
+
+# --- 1. trova il percorso del primo argomento utile ---------------------------
+target=""
+for arg in "$@"; do
+	case "$arg" in
+	'')
+		continue
+		;;
+	*://* | /*)
+		target=$(url_to_path "$arg")
+		break
+		;;
+	*)
+		[ -n "$target" ] || target="$arg"
+		;;
+	esac
+done
+
+[ -n "$target" ] || die "Nessun percorso ricevuto dal menu di Dolphin."
+
+# --- 2. ricava la cartella di lavoro (e l'eventuale file) ---------------------
+#OPENCODE_HERE_FILE resta vuota se hai cliccato una cartella: in quel caso
+# opencode non riceve nessun --prompt e non parte nessuna richiesta all'AI.
+OPENCODE_HERE_FILE=""
+if [ -d "$target" ]; then
+	dir=$(CDPATH='' cd -- "$target" 2>/dev/null && pwd) || die "Cartella non accessibile: $target"
+else
+	parent=$(dirname -- "$target")
+	dir=$(CDPATH='' cd -- "$parent" 2>/dev/null && pwd) || die "Cartella non accessibile: $parent"
+	# Il file serve SEMPRE (per gli appunti). Se OPEN_FILE_IN_OPENCODE e' 1
+	# verra' anche passato a opencode con --prompt.
+	OPENCODE_HERE_FILE="$target"
+fi
+
+# --- 3. trova opencode --------------------------------------------------------
+if [ ! -x "$OPENCODE_BIN" ]; then
+	OPENCODE_BIN=$(command -v opencode 2>/dev/null) || die "opencode non trovato nel PATH."
+fi
+
+# --- 4. apre il terminale (stessa logica di "Apri terminale qui") ------------
+# La catena di fallback serve perche' se un giorno cambi terminale
+# l'entry del menu continua a funzionare.
+#
+# A "-e" passiamo SOLO il percorso di opencode-in (senza spazi): la cartella
+# di destinazione la legge lui da OPENCODE_HERE_DIR. Questo evita che una
+# cartella con spazi nel nome venga corrotta dalla shell di konsole.
+OPENCODE_HERE_DIR="$dir"
+export OPENCODE_HERE_DIR
+OPENCODE_HERE_FILE="$OPENCODE_HERE_FILE"
+export OPENCODE_HERE_FILE
+OPENCODE_HERE_COPY=0  # la copia la gestisce questo script, solo come ripiego
+export OPENCODE_HERE_COPY
+OPENCODE_HERE_SEND="$OPEN_FILE_IN_OPENCODE"
+export OPENCODE_HERE_SEND
+LAUNCHER=/home/zimu96/.local/bin/opencode-in
+
+# Il testo da mettere nella casella di scrittura di opencode.
+if [ -n "$OPENCODE_HERE_FILE" ]; then
+	PASTE_TEXT="@$OPENCODE_HERE_FILE"
+else
+	PASTE_TEXT="$dir"
+fi
+
+# konsole riusa il processo gia' aperto, quindi NON posso cercare un PID nuovo:
+# devo riconoscere la sessione giusta dal PID del processo che ci gira dentro.
+# Il launcher (opencode-in) scrive quel PID su un file e poi diventa opencode.
+TOKEN="$$-$(date +%s)"
+SESSIONFILE="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-here-ses.$TOKEN"
+rm -f "$SESSIONFILE" 2>/dev/null
+OPENCODE_HERE_TOKEN="$TOKEN"
+export OPENCODE_HERE_TOKEN
+
+if command -v kde-terminal-exec >/dev/null 2>&1; then
+	kde-terminal-exec --workdir "$dir" -e "$LAUNCHER" &
+elif command -v xdg-terminal-exec >/dev/null 2>&1; then
+	xdg-terminal-exec --working-directory="$dir" -e "$LAUNCHER" &
+elif command -v konsole >/dev/null 2>&1; then
+	konsole --workdir "$dir" -e "$LAUNCHER" &
+elif command -v kgx >/dev/null 2>&1; then
+	kgx --working-directory="$dir" -e "$LAUNCHER" &
+elif command -v alacritty >/dev/null 2>&1; then
+	alacritty --working-directory "$dir" -e "$LAUNCHER" &
+elif command -v xterm >/dev/null 2>&1; then
+	xterm -e "$LAUNCHER" &
+else
+	die "Nessun terminale trovato (konsole, kgx, alacritty, xterm...)."
+fi
+
+if [ "$AUTO_PASTE_IN_OPENCODE" != "1" ]; then
+	exit 0
+fi
+
+# --- 5. aspetta che il launcher ci dica quale sessione e' questa -------------
+# Il file contiene: "<PID> <bus> <indice sessione>". La seconda parte puo'
+# essere vuota se il launcher non ha trovato la sessione.
+sespid=""
+bus=""
+sess=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+	if [ -r "$SESSIONFILE" ]; then
+		read -r sespid bus sess <"$SESSIONFILE" 2>/dev/null || true
+		[ -n "$sespid" ] && break
+	fi
+	sleep 0.25
+done
+rm -f "$SESSIONFILE" 2>/dev/null
+
+# opencode deve avviarsi prima di poter ricevere il testo
+[ -n "$sespid" ] && sleep "$PASTE_DELAY"
+
+# --- 6. incolla il percorso dentro opencode, SENNO inviarlo --------------------
+# E' la stessa API di incolla di konsole (quella di Ctrl+Shift+V): il testo
+# finisce nella casella di scrittura, non viene mandato all'AI.
+pasted=0
+if [ -n "$bus" ] && [ -n "$sess" ]; then
+	for _try in 1 2 3 4 5; do
+		if qdbus6 "$bus" "/Sessions/$sess" org.kde.konsole.Session.sendText "$PASTE_TEXT" >/dev/null 2>&1; then
+			pasted=1
+			break
+		fi
+		sleep 0.5
+	done
+fi
+
+# Ripiego: se l'incolla non e' riuscita il percorso va negli appunti e lo
+# incolli a mano con Ctrl+Shift+V. Solo in questo caso, cosi' quando funziona
+# la cronologia del clipboard non si riempie di percorsi.
+if [ "$pasted" -eq 0 ] && [ "$CLIPBOARD_FALLBACK" = "1" ]; then
+	if command -v wl-copy >/dev/null 2>&1; then
+		printf '%s' "$PASTE_TEXT" | wl-copy --type text/plain 2>/dev/null
+	elif command -v qdbus6 >/dev/null 2>&1; then
+		qdbus6 org.kde.klipper /klipper setClipboardContents "$PASTE_TEXT" >/dev/null 2>&1
+	elif command -v xclip >/dev/null 2>&1; then
+		printf '%s' "$PASTE_TEXT" | xclip -selection clipboard 2>/dev/null
+	fi
+fi
+
+exit 0
